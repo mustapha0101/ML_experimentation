@@ -11,6 +11,7 @@ import numpy as np
 from datetime import datetime, timedelta
 from streamlit_lottie import st_lottie
 import requests
+import os
 
 # -------------------------
 # Page config
@@ -97,7 +98,7 @@ tab1, tab2 = st.tabs(["📊 Exploration", "📈 Prévisions"])
 with tab1:
     st.subheader("Statistiques générales")
     st.write(f"Nombre total d'événements : {len(filtered_df)}")
-    st.write(f"Nombre de PDQ : {filtered_df['PDQ'].nunique()}")
+    st.write(f"Nombre de PDQ ( postes de quartier) : {filtered_df['PDQ'].nunique()}")
 
     filtered_df['YEAR'] = filtered_df['DATE'].dt.year
     summary_year = filtered_df.groupby(['YEAR','CATEGORIE']).size().reset_index(name='Count')
@@ -106,12 +107,12 @@ with tab1:
     st.plotly_chart(fig_year, use_container_width=True)
 
     top_pdq = filtered_df.groupby('PDQ').size().reset_index(name='Count').sort_values('Count', ascending=False)
-    st.write(f"🏆 Top PDQ : {top_pdq.iloc[0]['PDQ']} ({top_pdq.iloc[0]['Count']} crimes)")
+    st.write(f"🏆 Le poste de quartier qui recense le plus de crimes - PDQ : {top_pdq.iloc[0]['PDQ']} ({top_pdq.iloc[0]['Count']} crimes)")
 
     summary_table = filtered_df.groupby(['PDQ','CATEGORIE']).size().reset_index(name='Count')
     st.dataframe(summary_table)
 
-    st.subheader("Carte des PDQ et crimes")
+    st.subheader("Carte des postes de quartier PDQ et crimes")
     with st.spinner("🗺️ Génération de la carte…"):
        
         m = folium.Map(
@@ -149,9 +150,20 @@ with tab1:
 # -------------------------
 # Onglet Prévisions
 # -------------------------
-# -------------------------
-# Onglet Prévisions
-# -------------------------
+PREDICTIONS_PROPHET_PATH = "predictions_prophet.csv"
+PREDICTIONS_RF_PATH = "predictions_rf.csv"
+
+def save_forecasts(df_prophet, df_rf):
+    df_prophet.to_csv(PREDICTIONS_PROPHET_PATH, index=False)
+    df_rf.to_csv(PREDICTIONS_RF_PATH, index=False)
+
+def load_forecasts():
+    if os.path.exists(PREDICTIONS_PROPHET_PATH) and os.path.exists(PREDICTIONS_RF_PATH):
+        df_prophet = pd.read_csv(PREDICTIONS_PROPHET_PATH, parse_dates=['ds'])
+        df_rf = pd.read_csv(PREDICTIONS_RF_PATH, parse_dates=['ds'])
+        return df_prophet, df_rf
+    return None, None
+
 with tab2:
     st.subheader("Prévisions améliorées: Prophet vs Random Forest")
 
@@ -165,8 +177,20 @@ with tab2:
     with col3:
         seuil = st.number_input("Afficher seulement si prévision ≥", min_value=0, value=0)
 
-    # Utiliser session_state pour stocker les prévisions
-    if "df_forecast_prophet" not in st.session_state or "df_forecast_rf" not in st.session_state or st.button("🚀 Lancer les prévisions"):
+    refresh = st.button("🔄 Rafraîchir les prévisions (recalculer)")
+
+    # Charger les prévisions sauvegardées si elles existent et pas de refresh demandé
+    if not refresh:
+        df_prophet_loaded, df_rf_loaded = load_forecasts()
+        if df_prophet_loaded is not None and df_rf_loaded is not None:
+            st.session_state.df_forecast_prophet = df_prophet_loaded
+            st.session_state.df_forecast_rf = df_rf_loaded
+
+    # Calculer et sauvegarder si besoin
+    if ("df_forecast_prophet" not in st.session_state or
+        "df_forecast_rf" not in st.session_state or
+        refresh):
+
         forecasts_prophet = []
         forecasts_rf = []
 
@@ -231,6 +255,9 @@ with tab2:
         st.session_state.df_forecast_prophet = pd.concat(forecasts_prophet).drop_duplicates(subset=['ds','PDQ','CATEGORIE'])
         st.session_state.df_forecast_rf = pd.concat(forecasts_rf).drop_duplicates(subset=['ds','PDQ','CATEGORIE'])
 
+        # Sauvegarder les prévisions pour les futurs chargements
+        save_forecasts(st.session_state.df_forecast_prophet, st.session_state.df_forecast_rf)
+
     # Affichage de la carte (cumul sur la période de prévision)
     if "df_forecast_prophet" in st.session_state and "df_forecast_rf" in st.session_state:
         df_forecast_prophet = st.session_state.df_forecast_prophet
@@ -276,23 +303,18 @@ with tab2:
             ).add_to(map_period)
 
         # --- Ajout des points de prévision cumulée par type ---
-        # Pour chaque PDQ, placer les points dans le polygone (pas tous au centroïde)
         for _, row in pdq_boundaries.iterrows():
             pdq_id = row['PDQ']
             crimes_here = [t for t in filter_types if t in selected_types]
             polygon = row['geometry']
 
-            # Générer des positions réparties dans le polygone pour chaque type de crime
-            # Si possible, utiliser les vrais coordonnées des crimes historiques
             for i, crime_type in enumerate(crimes_here):
-                # Historique observé sur période équivalente (moyenne sur n périodes de même durée)
                 hist_df = filtered_df[
                     (filtered_df['PDQ']==pdq_id) & (filtered_df['CATEGORIE']==crime_type)
                 ]
                 rolling_hist = hist_df.groupby('DATE').size().rolling(window=periods).sum().dropna()
                 hist_mean = rolling_hist.mean() if not rolling_hist.empty else 0
 
-                # Prévisions cumulées
                 prophet_sum = prophet_period[
                     (prophet_period['PDQ']==pdq_id) &
                     (prophet_period['CATEGORIE']==crime_type)
@@ -306,7 +328,6 @@ with tab2:
                 if np.isnan(prophet_sum) or np.isnan(rf_sum) or (prophet_sum<seuil and rf_sum<seuil):
                     continue
 
-                # Déterminer tendance (par rapport à moyenne historique)
                 if prophet_sum > hist_mean * 1.1:
                     color = "red"; tendance = "⚠️ Hausse attendue"
                 elif prophet_sum < hist_mean * 0.9:
@@ -317,26 +338,22 @@ with tab2:
                 # 1. Essayer d'utiliser les vraies coordonnées des crimes historiques
                 lat, lon = None, None
                 if not hist_df.empty:
-                    # Prendre la médiane des coordonnées historiques pour ce type/PDQ
                     lat = hist_df['LATITUDE'].median()
                     lon = hist_df['LONGITUDE'].median()
-                    # Vérifier si le point est bien dans le polygone, sinon fallback
                     from shapely.geometry import Point
                     if not polygon.contains(Point(lon, lat)):
                         lat, lon = None, None
 
-                # 2. Si pas de coordonnées valides, répartir dans le polygone autour du centroïde
+                # 2. Sinon, répartir dans le polygone autour du centroïde
                 if lat is None or lon is None:
                     centroid = polygon.centroid
-                    # Décalage circulaire pour chaque type de crime
                     type_offsets = np.linspace(0, 2 * np.pi, num=len(crimes_here), endpoint=False)
-                    offset_radius = 0.002  # Ajuste ce rayon pour espacer plus ou moins les points
+                    offset_radius = 0.002
                     angle = type_offsets[i]
                     lat_offset = offset_radius * np.cos(angle)
                     lon_offset = offset_radius * np.sin(angle)
                     lat = centroid.y + lat_offset
                     lon = centroid.x + lon_offset
-                    # Si le point n'est pas dans le polygone, ramener au centroïde
                     if not polygon.contains(Point(lon, lat)):
                         lat = centroid.y
                         lon = centroid.x
@@ -362,8 +379,19 @@ with tab2:
 
         folium_static(map_period, width=1200, height=600)
 
+        # Ajout d'une légende claire sous la carte
         st.markdown("""
-        💡 **Légende carte**  
-        - Polygones : PDQ, couleur selon présence de prévision (rouge = prévision, gris = aucune)
-        - Points : prévision cumulée par type de crime (répartis dans le polygone ou selon la médiane des faits)
-               """)
+        <div style="background-color:#f9f9f9;padding:10px;border-radius:8px;border:1px solid #eee;">
+        <b>🗺️ Légende de la carte :</b><br>
+        <ul>
+        <li><b>Polygones</b> : PDQ, couleur selon présence de prévision (rouge = prévision, gris = aucune)</li>
+        <li><b>Points</b> : prévision cumulée par type de crime (répartis dans le polygone ou selon la médiane des faits historiques)</li>
+        <li><b>Couleur du point</b> :<br>
+            <span style="color:red;">Rouge</span> = hausse attendue<br>
+            <span style="color:green;">Vert</span> = baisse attendue<br>
+            <span style="color:gray;">Gris</span> = stable
+        </li>
+        <li><b>Popup</b> : détail des prévisions Prophet et Random Forest, tendance vs historique</li>
+        </ul>
+        </div>
+        """, unsafe_allow_html=True)
