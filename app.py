@@ -1,7 +1,6 @@
 import streamlit as st
 import pandas as pd
-import fiona
-import shapely.geometry as geom
+import geopandas as gpd
 from prophet import Prophet
 import folium
 from streamlit_folium import folium_static
@@ -36,15 +35,7 @@ lottie_predict = load_lottie_url("https://assets10.lottiefiles.com/packages/lf20
 # -------------------------
 @st.cache_data
 def load_pdq_boundaries():
-    features = []
-    with fiona.open("limitespdq.geojson") as src:
-        for f in src:
-            geom_shape = geom.shape(f["geometry"])
-            features.append({
-                "PDQ": f["properties"]["PDQ"],
-                "geometry": geom_shape
-            })
-    return pd.DataFrame(features)
+    return gpd.read_file("limitespdq.geojson")
 
 @st.cache_data
 def load_crime_data():
@@ -122,15 +113,14 @@ with tab1:
 
     st.subheader("Carte des PDQ et crimes")
     m = folium.Map(
-        location=[pdq_boundaries.geometry.apply(lambda g: g.centroid.y).mean(), 
-                  pdq_boundaries.geometry.apply(lambda g: g.centroid.x).mean()],
+        location=[pdq_boundaries.geometry.centroid.y.mean(), pdq_boundaries.geometry.centroid.x.mean()],
         zoom_start=11
     )
 
     for _, row in pdq_boundaries.iterrows():
         pdq_count = filtered_df[filtered_df['PDQ']==row['PDQ']].shape[0]
         folium.GeoJson(
-            row['geometry'].__geo_interface__,
+            row['geometry'],
             style_function=lambda feature, clr=('#FF9999' if pdq_count>0 else '#CCCCCC'): {
                 'fillColor': clr,
                 'color': 'black',
@@ -153,3 +143,121 @@ with tab1:
             ).add_to(m)
 
     folium_static(m, width=1200, height=600)
+
+# -------------------------
+# Onglet Prévisions
+# -------------------------
+with tab2:
+    st.subheader("Prévisions Prophet et Random Forest")
+    periods = st.sidebar.slider("Période de prévision (jours)", 7, 90, 30)
+
+    forecasts_prophet = []
+    forecasts_rf = []
+
+    if lottie_predict:
+        with st.spinner("🔄 Génération des prévisions..."):
+            st_lottie(lottie_predict, height=100, key="predicting")
+
+            for pdq in selected_pdqs:
+                for crime_type in selected_types:
+                    df_subset = filtered_df[(filtered_df['PDQ']==pdq) & (filtered_df['CATEGORIE']==crime_type)]
+                    if len(df_subset) < 2:
+                        continue
+                    df_daily = df_subset.groupby('DATE').size().reset_index(name='y').rename(columns={'DATE':'ds'})
+                    if len(df_daily) < 2:
+                        continue
+
+                    # Prophet
+                    m = Prophet(yearly_seasonality=True, weekly_seasonality=True)
+                    try:
+                        m.fit(df_daily)
+                    except:
+                        continue
+                    future = m.make_future_dataframe(periods=periods)
+                    future = future[future['ds'] >= pd.to_datetime(datetime.today().date())]
+                    if future.empty:
+                        continue
+                    forecast = m.predict(future)
+                    forecast['PDQ'] = pdq
+                    forecast['CATEGORIE'] = crime_type
+                    forecasts_prophet.append(forecast[['ds','yhat','PDQ','CATEGORIE']])
+
+                    # Random Forest
+                    df_daily['dayofyear'] = df_daily['ds'].dt.dayofyear
+                    X = df_daily[['dayofyear']]
+                    y = df_daily['y']
+                    rf = RandomForestRegressor(n_estimators=100, random_state=42)
+                    rf.fit(X, y)
+                    future_rf = pd.DataFrame({'ds': pd.date_range(df_daily['ds'].max()+timedelta(days=1), periods=periods)})
+                    future_rf['dayofyear'] = future_rf['ds'].dt.dayofyear
+                    future_rf_pred = rf.predict(future_rf[['dayofyear']])
+                    future_rf['yhat'] = future_rf_pred
+                    future_rf['PDQ'] = pdq
+                    future_rf['CATEGORIE'] = crime_type
+                    forecasts_rf.append(future_rf[['ds','yhat','PDQ','CATEGORIE']])
+
+    if not forecasts_prophet or not forecasts_rf:
+        st.warning("Pas assez de données pour générer des prévisions.")
+        st.stop()
+
+    df_forecast_prophet = pd.concat(forecasts_prophet).drop_duplicates(subset=['ds','PDQ','CATEGORIE'])
+    df_forecast_rf = pd.concat(forecasts_rf).drop_duplicates(subset=['ds','PDQ','CATEGORIE'])
+
+    st.subheader("Comparaison des prévisions")
+    st.write("✅ Prophet vs Random Forest pour chaque PDQ et type de crime")
+
+    selected_day = st.slider("Sélectionner le jour de prévision", 
+                             min_value=df_forecast_prophet['ds'].min().date(), 
+                             max_value=df_forecast_prophet['ds'].max().date(), 
+                             value=df_forecast_prophet['ds'].min().date())
+
+    map_day = folium.Map(
+        location=[pdq_boundaries.geometry.centroid.y.mean(), pdq_boundaries.geometry.centroid.x.mean()],
+        zoom_start=11
+    )
+
+    # Pour chaque PDQ et type, afficher Prophet et RF
+    pdq_type_combinations = pd.MultiIndex.from_product([selected_pdqs, selected_types], names=['PDQ','CATEGORIE']).to_frame(index=False)
+
+    for model_name, df_forecast in zip(['Prophet','Random Forest'], [df_forecast_prophet, df_forecast_rf]):
+        filter_day = df_forecast[df_forecast['ds']==pd.to_datetime(selected_day)]
+        filter_day_full = pdq_type_combinations.merge(filter_day, on=['PDQ','CATEGORIE'], how='left').fillna(0)
+
+        for _, row in pdq_boundaries.iterrows():
+            pdq_id = row['PDQ']
+            tooltip_lines = []
+            hist_mean = filtered_df[filtered_df['PDQ']==pdq_id].groupby('CATEGORIE').size() / max(1,(filtered_df['DATE'].max()-filtered_df['DATE'].min()).days)
+            for _, pred in filter_day_full[filter_day_full['PDQ']==pdq_id].iterrows():
+                crime_type = pred['CATEGORIE']
+                yhat = pred['yhat']
+                mean_hist = hist_mean.get(crime_type, 0)
+                trend = "Augmentation" if yhat>mean_hist else "Baisse"
+                tooltip_lines.append(f"{crime_type} ({model_name}): {yhat:.1f}, Moyenne: {mean_hist:.1f}, {trend}")
+
+                if show_points:
+                    pdq_geom = pdq_boundaries[pdq_boundaries['PDQ']==pdq_id].geometry
+                    if not pdq_geom.empty:
+                        centroid = pdq_geom.centroid.iloc[0]
+                        color = px.colors.qualitative.Dark24[selected_types.index(crime_type) % 24]
+                        folium.CircleMarker(
+                            location=[centroid.y, centroid.x],
+                            radius=5,
+                            color=color,
+                            fill=True,
+                            fill_opacity=0.7,
+                            tooltip=f"{crime_type} ({model_name}) Prévision: {yhat:.1f}, Moyenne: {mean_hist:.1f}, {trend}"
+                        ).add_to(map_day)
+
+            # Tooltip polygone PDQ
+            folium.GeoJson(
+                row['geometry'],
+                style_function=lambda feature: {'fillColor':'#CCCCCC','color':'black','weight':1,'fillOpacity':0.3},
+                tooltip="<br>".join(tooltip_lines)
+            ).add_to(map_day)
+
+    folium_static(map_day, width=1200, height=600)
+    st.markdown("""
+    💡 **Légende carte**  
+    - 🔴/🔵 Points : prévisions par type de crime (couleur différente)  
+    - Polygones : PDQ avec prévisions Prophet et Random Forest
+    """)
