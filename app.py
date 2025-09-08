@@ -16,7 +16,7 @@ import requests
 # Page config
 # -------------------------
 st.set_page_config(page_title="Dashboard crimes Montréal", layout="wide")
-st.title("🔍 Dashboard pédagogique des crimes à Montréal")
+st.title("🔍 Prédiction des crimes à Montréal")
 
 # -------------------------
 # Lottie animations
