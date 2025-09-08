@@ -12,6 +12,7 @@ from datetime import datetime, timedelta
 from streamlit_lottie import st_lottie
 import requests
 import os
+import hashlib
 
 # -------------------------
 # Page config
@@ -61,26 +62,37 @@ with st.sidebar.form("periode_form"):
     end_date = st.date_input("Date de fin", min_value=min_date, max_value=max_date, value=max_date)
     apply_period = st.form_submit_button("Appliquer la période")
 
-filtered_df = crime_data[
+# Pour l'exploration : on applique les filtres de date
+filtered_df_exploration = crime_data[
     (crime_data['DATE']>=pd.to_datetime(start_date)) & 
     (crime_data['DATE']<=pd.to_datetime(end_date))
 ] if apply_period else crime_data.copy()
 
-if filtered_df.empty:
+if filtered_df_exploration.empty:
     st.warning("⚠️ Pas de données pour cette période.")
     st.stop()
 
-types_crime = filtered_df['CATEGORIE'].unique().tolist()
+types_crime = filtered_df_exploration['CATEGORIE'].unique().tolist()
 selected_types = st.sidebar.multiselect("Type de crime", types_crime, default=types_crime)
 
-pdq_options = sorted(filtered_df['PDQ'].unique())
+pdq_options = sorted(filtered_df_exploration['PDQ'].unique())
 selected_pdqs = st.sidebar.multiselect("Sélectionner PDQ(s)", pdq_options, default=pdq_options)
 
 show_points = st.sidebar.checkbox("Afficher points d'intersection", value=True)
 
-filtered_df = filtered_df[
-    (filtered_df['CATEGORIE'].isin(selected_types)) &
-    (filtered_df['PDQ'].isin(selected_pdqs))
+filtered_df_exploration = filtered_df_exploration[
+    (filtered_df_exploration['CATEGORIE'].isin(selected_types)) &
+    (filtered_df_exploration['PDQ'].isin(selected_pdqs))
+]
+
+if filtered_df_exploration.empty:
+    st.warning("⚠️ Pas de données pour ces filtres.")
+    st.stop()
+
+# Pour les prévisions : on utilise toujours tout l'historique, sans filtre de date
+filtered_df = crime_data[
+    (crime_data['CATEGORIE'].isin(selected_types)) &
+    (crime_data['PDQ'].isin(selected_pdqs))
 ]
 
 if filtered_df.empty:
@@ -90,26 +102,26 @@ if filtered_df.empty:
 # -------------------------
 # Tabs
 # -------------------------
-tab1, tab2 = st.tabs(["📊 Exploration", "📈 Prévisions"])
+tab1, tab2, tab3 = st.tabs(["📊 Exploration", "📈 Prévisions", "📋 Scores MAE/RMSE"])
 
 # -------------------------
 # Onglet Exploration
 # -------------------------
 with tab1:
     st.subheader("Statistiques générales")
-    st.write(f"Nombre total d'événements : {len(filtered_df)}")
-    st.write(f"Nombre de PDQ ( postes de quartier) : {filtered_df['PDQ'].nunique()}")
+    st.write(f"Nombre total d'événements : {len(filtered_df_exploration)}")
+    st.write(f"Nombre de PDQ ( postes de quartier) : {filtered_df_exploration['PDQ'].nunique()}")
 
-    filtered_df['YEAR'] = filtered_df['DATE'].dt.year
-    summary_year = filtered_df.groupby(['YEAR','CATEGORIE']).size().reset_index(name='Count')
+    filtered_df_exploration['YEAR'] = filtered_df_exploration['DATE'].dt.year
+    summary_year = filtered_df_exploration.groupby(['YEAR','CATEGORIE']).size().reset_index(name='Count')
     fig_year = px.bar(summary_year, x='YEAR', y='Count', color='CATEGORIE', barmode='stack',
                       title="Crimes par année et type")
     st.plotly_chart(fig_year, use_container_width=True)
 
-    top_pdq = filtered_df.groupby('PDQ').size().reset_index(name='Count').sort_values('Count', ascending=False)
+    top_pdq = filtered_df_exploration.groupby('PDQ').size().reset_index(name='Count').sort_values('Count', ascending=False)
     st.write(f"🏆 Le poste de quartier qui recense le plus de crimes - PDQ : {top_pdq.iloc[0]['PDQ']} ({top_pdq.iloc[0]['Count']} crimes)")
 
-    summary_table = filtered_df.groupby(['PDQ','CATEGORIE']).size().reset_index(name='Count')
+    summary_table = filtered_df_exploration.groupby(['PDQ','CATEGORIE']).size().reset_index(name='Count')
     st.dataframe(summary_table)
 
     st.subheader("Carte des postes de quartier PDQ et crimes")
@@ -121,7 +133,7 @@ with tab1:
         )
 
         for _, row in pdq_boundaries.iterrows():
-            pdq_count = filtered_df[filtered_df['PDQ']==row['PDQ']].shape[0]
+            pdq_count = filtered_df_exploration[filtered_df_exploration['PDQ']==row['PDQ']].shape[0]
             folium.GeoJson(
                 row['geometry'],
                 style_function=lambda feature, clr=('#FF9999' if pdq_count>0 else '#CCCCCC'): {
@@ -134,7 +146,7 @@ with tab1:
             ).add_to(m)
 
         if show_points:
-            points_count = filtered_df.groupby(['LATITUDE','LONGITUDE','CATEGORIE']).size().reset_index(name='Count')
+            points_count = filtered_df_exploration.groupby(['LATITUDE','LONGITUDE','CATEGORIE']).size().reset_index(name='Count')
             for _, crime in points_count.iterrows():
                 folium.CircleMarker(
                     location=[crime['LATITUDE'], crime['LONGITUDE']],
@@ -153,16 +165,25 @@ with tab1:
 PREDICTIONS_PROPHET_PATH = "predictions_prophet.csv"
 PREDICTIONS_RF_PATH = "predictions_rf.csv"
 
-def save_forecasts(df_prophet, df_rf):
-    df_prophet.to_csv(PREDICTIONS_PROPHET_PATH, index=False)
-    df_rf.to_csv(PREDICTIONS_RF_PATH, index=False)
+def save_forecasts(df_prophet, df_rf, start_date, end_date, pdqs, types):
+    prophet_file, rf_file = get_forecast_filenames(start_date, end_date, pdqs, types)
+    df_prophet.to_csv(prophet_file, index=False)
+    df_rf.to_csv(rf_file, index=False)
 
-def load_forecasts():
-    if os.path.exists(PREDICTIONS_PROPHET_PATH) and os.path.exists(PREDICTIONS_RF_PATH):
-        df_prophet = pd.read_csv(PREDICTIONS_PROPHET_PATH, parse_dates=['ds'])
-        df_rf = pd.read_csv(PREDICTIONS_RF_PATH, parse_dates=['ds'])
+def load_forecasts(start_date, end_date, pdqs, types):
+    prophet_file, rf_file = get_forecast_filenames(start_date, end_date, pdqs, types)
+    if os.path.exists(prophet_file) and os.path.exists(rf_file):
+        df_prophet = pd.read_csv(prophet_file, parse_dates=['ds'])
+        df_rf = pd.read_csv(rf_file, parse_dates=['ds'])
         return df_prophet, df_rf
     return None, None
+
+def get_forecast_filenames(start_date, end_date, pdqs, types):
+    key = f"{start_date}_{end_date}_{'_'.join(map(str, sorted(pdqs)))}_{'_'.join(sorted(types))}"
+    hash_key = hashlib.md5(key.encode()).hexdigest()
+    prophet_file = f"predictions_prophet_{hash_key}.csv"
+    rf_file = f"predictions_rf_{hash_key}.csv"
+    return prophet_file, rf_file
 
 with tab2:
     st.subheader("Prévisions : Prophet vs Random Forest")
@@ -181,7 +202,7 @@ with tab2:
 
     # Charger les prévisions sauvegardées si elles existent et pas de refresh demandé
     if not refresh:
-        df_prophet_loaded, df_rf_loaded = load_forecasts()
+        df_prophet_loaded, df_rf_loaded = load_forecasts(start_date, end_date, selected_pdqs, selected_types)
         if df_prophet_loaded is not None and df_rf_loaded is not None:
             st.session_state.df_forecast_prophet = df_prophet_loaded
             st.session_state.df_forecast_rf = df_rf_loaded
@@ -202,11 +223,11 @@ with tab2:
             for pdq in selected_pdqs:
                 for crime_type in selected_types:
                     task_count += 1
-                    st.write(f"🔄 PDQ {pdq}, type {crime_type} ({task_count}/{total_tasks})")
+                    st.write(f"🔄 PDQ {pdq}, type {crime_type} , tâche: ({task_count}/{total_tasks})")
                     bar.progress(task_count / total_tasks)
 
                     df_subset = filtered_df[(filtered_df['PDQ']==pdq) & (filtered_df['CATEGORIE']==crime_type)]
-                    if len(df_subset) < 2:
+                    if len(df_subset) < 3:
                         continue
 
                     df_daily = df_subset.groupby('DATE').size().reset_index(name='y').rename(columns={'DATE':'ds'})
@@ -256,7 +277,7 @@ with tab2:
         st.session_state.df_forecast_rf = pd.concat(forecasts_rf).drop_duplicates(subset=['ds','PDQ','CATEGORIE'])
 
         # Sauvegarder les prévisions pour les futurs chargements
-        save_forecasts(st.session_state.df_forecast_prophet, st.session_state.df_forecast_rf)
+        save_forecasts(st.session_state.df_forecast_prophet, st.session_state.df_forecast_rf, start_date, end_date, selected_pdqs, selected_types)
 
     # Affichage de la carte (cumul sur la période de prévision)
     if "df_forecast_prophet" in st.session_state and "df_forecast_rf" in st.session_state:
@@ -395,3 +416,135 @@ with tab2:
         </ul>
         </div>
         """, unsafe_allow_html=True)
+
+# -------------------------
+# Fonctions pour sauvegarder/charger les scores
+# -------------------------
+SCORES_PATH = "scores_mae_rmse.csv"
+
+def save_scores(df_scores):
+    df_scores.to_csv(SCORES_PATH, index=False)
+
+def load_scores():
+    if os.path.exists(SCORES_PATH):
+        return pd.read_csv(SCORES_PATH)
+    return None
+from prophet.diagnostics import cross_validation, performance_metrics
+
+# -------------------------
+# Onglet Scores MAE/RMSE avec cross-validation
+# -------------------------
+with tab3:
+    st.subheader("Comparaison des modèles : MAE et RMSE sur l'historique (Hold-out)")
+
+    run_scores = st.button("🚦 Lancer l'analyse des scores (Hold-out)")
+
+    if run_scores:
+        with st.spinner("Calcul des scores en cours..."):
+            scores = []
+            all_pdqs = sorted(crime_data['PDQ'].unique())
+            all_types = sorted(crime_data['CATEGORIE'].unique())
+            for pdq in all_pdqs:
+                for crime_type in all_types:
+                    try:
+                        df_subset = crime_data[(crime_data['PDQ'] == pdq) & (crime_data['CATEGORIE'] == crime_type)]
+                        if len(df_subset) < 20:
+                            st.write(f"PDQ {pdq} - {crime_type} : moins de 20 événements ({len(df_subset)})")
+                            continue
+                        df_daily = (
+                            df_subset.groupby('DATE').size()
+                            .reset_index(name='y')
+                            .rename(columns={'DATE': 'ds'})
+                            .sort_values('ds')
+                        )
+                        df_daily['ds'] = pd.to_datetime(df_daily['ds'])
+                        if len(df_daily) < 20:
+                            st.write(f"PDQ {pdq} - {crime_type} : moins de 20 jours distincts ({len(df_daily)})")
+                            continue
+                        if df_daily['ds'].isnull().any() or df_daily['y'].isnull().any():
+                            st.write(f"PDQ {pdq} - {crime_type} : valeurs manquantes dans ds ou y")
+                            continue
+                        split_idx = int(len(df_daily) * 0.8)
+                        train = df_daily.iloc[:split_idx]
+                        test = df_daily.iloc[split_idx:]
+                        if test.empty or train.empty:
+                            st.write(f"PDQ {pdq} - {crime_type} : train={len(train)}, test={len(test)} (test ou train vide)")
+                            continue
+
+                        # Prophet
+                        try:
+                            m = Prophet(yearly_seasonality=True, weekly_seasonality=True, daily_seasonality=False, changepoint_prior_scale=0.1)
+                            m.fit(train)
+                            future = test[['ds']]
+                            forecast = m.predict(future)
+                            yhat_prophet = forecast['yhat'].values
+                            yhat_prophet = np.clip(yhat_prophet, 0, None)
+                            mae_prophet = mean_absolute_error(test['y'], yhat_prophet)
+                            rmse_prophet = np.sqrt(mean_squared_error(test['y'], yhat_prophet))
+                        except Exception as e:
+                            st.warning(f"Prophet fail: {e}")
+                            mae_prophet = rmse_prophet = np.nan
+
+                        # Random Forest
+                        try:
+                            train_rf = train.copy()
+                            test_rf = test.copy()
+                            for df_ in [train_rf, test_rf]:
+                                df_['dayofyear'] = df_['ds'].dt.dayofyear
+                                df_['month'] = df_['ds'].dt.month
+                                df_['weekday'] = df_['ds'].dt.weekday
+                                df_['lag_1'] = df_['y'].shift(1).fillna(0)
+                                df_['lag_7'] = df_['y'].shift(7).fillna(0)
+                                df_['rolling_7'] = df_['y'].rolling(7, min_periods=1).mean()
+                            X_train = train_rf[['dayofyear','month','weekday','lag_1','lag_7','rolling_7']]
+                            y_train = train_rf['y']
+                            X_test = test_rf[['dayofyear','month','weekday','lag_1','lag_7','rolling_7']]
+                            y_test = test_rf['y']
+                            if len(X_test) == 0 or len(y_test) == 0:
+                                st.write(f"PDQ {pdq} - {crime_type} : X_test ou y_test vide")
+                                mae_rf = rmse_rf = np.nan
+                            else:
+                                rf = RandomForestRegressor(n_estimators=300, max_depth=8, random_state=42)
+                                rf.fit(X_train, y_train)
+                                yhat_rf = rf.predict(X_test)
+                                yhat_rf = np.clip(yhat_rf, 0, None)
+                                mae_rf = mean_absolute_error(y_test, yhat_rf)
+                                rmse_rf = np.sqrt(mean_squared_error(y_test, yhat_rf))
+                        except Exception as e:
+                            st.warning(f"RF fail: {e}")
+                            mae_rf = rmse_rf = np.nan
+
+                        scores.append({
+                            "PDQ": pdq,
+                            "CATEGORIE": crime_type,
+                            "MAE_Prophet": mae_prophet,
+                            "RMSE_Prophet": rmse_prophet,
+                            "MAE_RF": mae_rf,
+                            "RMSE_RF": rmse_rf
+                        })
+                    except Exception as e:
+                        st.warning(f"Erreur pour PDQ {pdq}, {crime_type}: {e}")
+
+            df_scores = pd.DataFrame(scores)
+            if not df_scores.empty:
+                st.dataframe(df_scores, use_container_width=True)
+                st.markdown("""
+                <small>
+                <b>MAE</b> : Erreur absolue moyenne (plus c'est bas, mieux c'est)<br>
+                <b>RMSE</b> : Racine de l'erreur quadratique moyenne (sensible aux grosses erreurs)<br>
+                Scores calculés sur 20% des données historiques (test set).<br>
+                Les prédictions négatives sont ramenées à zéro.
+                </small>
+                """, unsafe_allow_html=True)
+                # Moyenne globale pour chaque modèle
+                mean_mae_prophet = df_scores["MAE_Prophet"].mean()
+                mean_mae_rf = df_scores["MAE_RF"].mean()
+                mean_rmse_prophet = df_scores["RMSE_Prophet"].mean()
+                mean_rmse_rf = df_scores["RMSE_RF"].mean()
+                st.write(f"**MAE moyen Prophet :** {mean_mae_prophet:.3f} | **Random Forest :** {mean_mae_rf:.3f}")
+                st.write(f"**RMSE moyen Prophet :** {mean_rmse_prophet:.3f} | **Random Forest :** {mean_rmse_rf:.3f}")
+            else:
+                st.info("Pas assez de données pour afficher les scores.")
+    else:
+        st.info("Clique sur le bouton ci-dessus pour lancer l'analyse des scores MAE/RMSE.")
+
