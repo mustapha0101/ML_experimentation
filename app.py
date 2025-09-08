@@ -165,7 +165,7 @@ def load_forecasts():
     return None, None
 
 with tab2:
-    st.subheader("Prévisions améliorées: Prophet vs Random Forest")
+    st.subheader("Prévisions : Prophet vs Random Forest")
 
     # Filtres spécifiques à la carte
     st.markdown("### 🎛️ Filtres carte")
