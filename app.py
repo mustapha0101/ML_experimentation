@@ -112,152 +112,258 @@ with tab1:
     st.dataframe(summary_table)
 
     st.subheader("Carte des PDQ et crimes")
-    m = folium.Map(
-        location=[pdq_boundaries.geometry.centroid.y.mean(), pdq_boundaries.geometry.centroid.x.mean()],
-        zoom_start=11
-    )
+    with st.spinner("🗺️ Génération de la carte…"):
+       
+        m = folium.Map(
+            location=[pdq_boundaries.geometry.centroid.y.mean(), pdq_boundaries.geometry.centroid.x.mean()],
+            zoom_start=11
+        )
 
-    for _, row in pdq_boundaries.iterrows():
-        pdq_count = filtered_df[filtered_df['PDQ']==row['PDQ']].shape[0]
-        folium.GeoJson(
-            row['geometry'],
-            style_function=lambda feature, clr=('#FF9999' if pdq_count>0 else '#CCCCCC'): {
-                'fillColor': clr,
-                'color': 'black',
-                'weight': 1,
-                'fillOpacity': 0.3,
-            },
-            tooltip=f"PDQ: {row['PDQ']} | Nombre de crimes: {pdq_count}"
-        ).add_to(m)
-
-    if show_points:
-        points_count = filtered_df.groupby(['LATITUDE','LONGITUDE','CATEGORIE']).size().reset_index(name='Count')
-        for _, crime in points_count.iterrows():
-            folium.CircleMarker(
-                location=[crime['LATITUDE'], crime['LONGITUDE']],
-                radius=3,
-                color='red',
-                fill=True,
-                fill_opacity=0.7,
-                tooltip=f"{crime['CATEGORIE']} ({crime['Count']})"
+        for _, row in pdq_boundaries.iterrows():
+            pdq_count = filtered_df[filtered_df['PDQ']==row['PDQ']].shape[0]
+            folium.GeoJson(
+                row['geometry'],
+                style_function=lambda feature, clr=('#FF9999' if pdq_count>0 else '#CCCCCC'): {
+                    'fillColor': clr,
+                    'color': 'black',
+                    'weight': 1,
+                    'fillOpacity': 0.3,
+                },
+                tooltip=f"PDQ: {row['PDQ']} | Nombre de crimes: {pdq_count}"
             ).add_to(m)
 
-    folium_static(m, width=1200, height=600)
+        if show_points:
+            points_count = filtered_df.groupby(['LATITUDE','LONGITUDE','CATEGORIE']).size().reset_index(name='Count')
+            for _, crime in points_count.iterrows():
+                folium.CircleMarker(
+                    location=[crime['LATITUDE'], crime['LONGITUDE']],
+                    radius=3,
+                    color='red',
+                    fill=True,
+                    fill_opacity=0.7,
+                    tooltip=f"{crime['CATEGORIE']} ({crime['Count']})"
+                ).add_to(m)
+
+        folium_static(m, width=1200, height=600)
 
 # -------------------------
 # Onglet Prévisions
 # -------------------------
+# -------------------------
+# Onglet Prévisions
+# -------------------------
 with tab2:
-    st.subheader("Prévisions Prophet et Random Forest")
-    periods = st.sidebar.slider("Période de prévision (jours)", 7, 90, 30)
+    st.subheader("Prévisions améliorées: Prophet vs Random Forest")
 
-    forecasts_prophet = []
-    forecasts_rf = []
+    # Filtres spécifiques à la carte
+    st.markdown("### 🎛️ Filtres carte")
+    col1, col2, col3 = st.columns(3)
+    with col1:
+        periods = st.slider("Période de prévision (jours)", 7, 90, 30)
+    with col2:
+        filter_types = st.multiselect("Types de crimes à afficher", selected_types, default=selected_types)
+    with col3:
+        seuil = st.number_input("Afficher seulement si prévision ≥", min_value=0, value=0)
 
-    if lottie_predict:
-        with st.spinner("🔄 Génération des prévisions..."):
-            st_lottie(lottie_predict, height=100, key="predicting")
+    # Utiliser session_state pour stocker les prévisions
+    if "df_forecast_prophet" not in st.session_state or "df_forecast_rf" not in st.session_state or st.button("🚀 Lancer les prévisions"):
+        forecasts_prophet = []
+        forecasts_rf = []
+
+        with st.status("Prévisions en cours...", expanded=True) as status:
+            total_tasks = len(selected_pdqs) * len(selected_types)
+            task_count = 0
+            bar = st.progress(0)
 
             for pdq in selected_pdqs:
                 for crime_type in selected_types:
+                    task_count += 1
+                    st.write(f"🔄 PDQ {pdq}, type {crime_type} ({task_count}/{total_tasks})")
+                    bar.progress(task_count / total_tasks)
+
                     df_subset = filtered_df[(filtered_df['PDQ']==pdq) & (filtered_df['CATEGORIE']==crime_type)]
                     if len(df_subset) < 2:
                         continue
+
                     df_daily = df_subset.groupby('DATE').size().reset_index(name='y').rename(columns={'DATE':'ds'})
                     if len(df_daily) < 2:
                         continue
 
                     # Prophet
-                    m = Prophet(yearly_seasonality=True, weekly_seasonality=True)
+                    m = Prophet(yearly_seasonality=True, weekly_seasonality=True, daily_seasonality=False, changepoint_prior_scale=0.1)
                     try:
                         m.fit(df_daily)
-                    except:
-                        continue
-                    future = m.make_future_dataframe(periods=periods)
-                    future = future[future['ds'] >= pd.to_datetime(datetime.today().date())]
-                    if future.empty:
-                        continue
-                    forecast = m.predict(future)
-                    forecast['PDQ'] = pdq
-                    forecast['CATEGORIE'] = crime_type
-                    forecasts_prophet.append(forecast[['ds','yhat','PDQ','CATEGORIE']])
+                        future = m.make_future_dataframe(periods=periods)
+                        future = future[future['ds'] >= pd.to_datetime(datetime.today().date())]
+                        if not future.empty:
+                            forecast = m.predict(future)
+                            forecast['PDQ'] = pdq
+                            forecast['CATEGORIE'] = crime_type
+                            forecasts_prophet.append(forecast[['ds','yhat','PDQ','CATEGORIE']])
+                    except Exception as e:
+                        st.warning(f"⚠️ Prophet a échoué pour PDQ {pdq}, {crime_type}: {e}")
 
                     # Random Forest
                     df_daily['dayofyear'] = df_daily['ds'].dt.dayofyear
-                    X = df_daily[['dayofyear']]
+                    df_daily['month'] = df_daily['ds'].dt.month
+                    df_daily['weekday'] = df_daily['ds'].dt.weekday
+                    X = df_daily[['dayofyear','month','weekday']]
                     y = df_daily['y']
-                    rf = RandomForestRegressor(n_estimators=100, random_state=42)
+
+                    rf = RandomForestRegressor(n_estimators=200, max_depth=5, random_state=42)
                     rf.fit(X, y)
-                    future_rf = pd.DataFrame({'ds': pd.date_range(df_daily['ds'].max()+timedelta(days=1), periods=periods)})
+
+                    future_rf = pd.DataFrame({'ds': pd.date_range(df_daily['ds'].max() + timedelta(days=1), periods=periods)})
                     future_rf['dayofyear'] = future_rf['ds'].dt.dayofyear
-                    future_rf_pred = rf.predict(future_rf[['dayofyear']])
-                    future_rf['yhat'] = future_rf_pred
+                    future_rf['month'] = future_rf['ds'].dt.month
+                    future_rf['weekday'] = future_rf['ds'].dt.weekday
+                    future_rf['yhat'] = rf.predict(future_rf[['dayofyear','month','weekday']])
                     future_rf['PDQ'] = pdq
                     future_rf['CATEGORIE'] = crime_type
                     forecasts_rf.append(future_rf[['ds','yhat','PDQ','CATEGORIE']])
 
-    if not forecasts_prophet or not forecasts_rf:
-        st.warning("Pas assez de données pour générer des prévisions.")
-        st.stop()
+            status.update(label="✅ Prévisions terminées", state="complete")
 
-    df_forecast_prophet = pd.concat(forecasts_prophet).drop_duplicates(subset=['ds','PDQ','CATEGORIE'])
-    df_forecast_rf = pd.concat(forecasts_rf).drop_duplicates(subset=['ds','PDQ','CATEGORIE'])
+        if not forecasts_prophet or not forecasts_rf:
+            st.warning("Pas assez de données pour générer des prévisions.")
+            st.stop()
 
-    st.subheader("Comparaison des prévisions")
-    st.write("✅ Prophet vs Random Forest pour chaque PDQ et type de crime")
+        st.session_state.df_forecast_prophet = pd.concat(forecasts_prophet).drop_duplicates(subset=['ds','PDQ','CATEGORIE'])
+        st.session_state.df_forecast_rf = pd.concat(forecasts_rf).drop_duplicates(subset=['ds','PDQ','CATEGORIE'])
 
-    selected_day = st.slider("Sélectionner le jour de prévision", 
-                             min_value=df_forecast_prophet['ds'].min().date(), 
-                             max_value=df_forecast_prophet['ds'].max().date(), 
-                             value=df_forecast_prophet['ds'].min().date())
+    # Affichage de la carte (cumul sur la période de prévision)
+    if "df_forecast_prophet" in st.session_state and "df_forecast_rf" in st.session_state:
+        df_forecast_prophet = st.session_state.df_forecast_prophet
+        df_forecast_rf = st.session_state.df_forecast_rf
 
-    map_day = folium.Map(
-        location=[pdq_boundaries.geometry.centroid.y.mean(), pdq_boundaries.geometry.centroid.x.mean()],
-        zoom_start=11
-    )
+        st.subheader("Carte des prévisions cumulées sur la période")
+        # Définir la période de prévision
+        min_pred_date = df_forecast_prophet['ds'].min().date()
+        max_pred_date = (min_pred_date + timedelta(days=periods-1))
 
-    # Pour chaque PDQ et type, afficher Prophet et RF
-    pdq_type_combinations = pd.MultiIndex.from_product([selected_pdqs, selected_types], names=['PDQ','CATEGORIE']).to_frame(index=False)
+        st.write(f"Période de prévision : {min_pred_date} au {max_pred_date}")
 
-    for model_name, df_forecast in zip(['Prophet','Random Forest'], [df_forecast_prophet, df_forecast_rf]):
-        filter_day = df_forecast[df_forecast['ds']==pd.to_datetime(selected_day)]
-        filter_day_full = pdq_type_combinations.merge(filter_day, on=['PDQ','CATEGORIE'], how='left').fillna(0)
+        # Filtrer les prévisions sur la période
+        mask_period = (df_forecast_prophet['ds'].dt.date >= min_pred_date) & (df_forecast_prophet['ds'].dt.date <= max_pred_date)
+        prophet_period = df_forecast_prophet[mask_period]
+        rf_period = df_forecast_rf[(df_forecast_rf['ds'].dt.date >= min_pred_date) & (df_forecast_rf['ds'].dt.date <= max_pred_date)]
 
+        map_period = folium.Map(
+            location=[pdq_boundaries.geometry.centroid.y.mean(), pdq_boundaries.geometry.centroid.x.mean()],
+            zoom_start=11
+        )
+
+        # --- Ajout des polygones PDQ ---
         for _, row in pdq_boundaries.iterrows():
             pdq_id = row['PDQ']
-            tooltip_lines = []
-            hist_mean = filtered_df[filtered_df['PDQ']==pdq_id].groupby('CATEGORIE').size() / max(1,(filtered_df['DATE'].max()-filtered_df['DATE'].min()).days)
-            for _, pred in filter_day_full[filter_day_full['PDQ']==pdq_id].iterrows():
-                crime_type = pred['CATEGORIE']
-                yhat = pred['yhat']
-                mean_hist = hist_mean.get(crime_type, 0)
-                trend = "Augmentation" if yhat>mean_hist else "Baisse"
-                tooltip_lines.append(f"{crime_type} ({model_name}): {yhat:.1f}, Moyenne: {mean_hist:.1f}, {trend}")
-
-                if show_points:
-                    pdq_geom = pdq_boundaries[pdq_boundaries['PDQ']==pdq_id].geometry
-                    if not pdq_geom.empty:
-                        centroid = pdq_geom.centroid.iloc[0]
-                        color = px.colors.qualitative.Dark24[selected_types.index(crime_type) % 24]
-                        folium.CircleMarker(
-                            location=[centroid.y, centroid.x],
-                            radius=5,
-                            color=color,
-                            fill=True,
-                            fill_opacity=0.7,
-                            tooltip=f"{crime_type} ({model_name}) Prévision: {yhat:.1f}, Moyenne: {mean_hist:.1f}, {trend}"
-                        ).add_to(map_day)
-
-            # Tooltip polygone PDQ
+            # Calcul du cumul total des prévisions pour ce PDQ (tous types sélectionnés)
+            prophet_sum_total = prophet_period[prophet_period['PDQ'] == pdq_id]['yhat'].sum()
+            rf_sum_total = rf_period[rf_period['PDQ'] == pdq_id]['yhat'].sum()
+            # Couleur selon la somme Prophet (plus la valeur est haute, plus c'est rouge)
+            if prophet_sum_total > 0:
+                fill_color = "#FF9999"
+            else:
+                fill_color = "#CCCCCC"
             folium.GeoJson(
                 row['geometry'],
-                style_function=lambda feature: {'fillColor':'#CCCCCC','color':'black','weight':1,'fillOpacity':0.3},
-                tooltip="<br>".join(tooltip_lines)
-            ).add_to(map_day)
+                style_function=lambda feature, clr=fill_color: {
+                    'fillColor': clr,
+                    'color': 'black',
+                    'weight': 1,
+                    'fillOpacity': 0.3,
+                },
+                tooltip=f"PDQ: {pdq_id} | Prophet (cumul): {prophet_sum_total:.1f} | RF (cumul): {rf_sum_total:.1f}"
+            ).add_to(map_period)
 
-    folium_static(map_day, width=1200, height=600)
-    st.markdown("""
-    💡 **Légende carte**  
-    - 🔴/🔵 Points : prévisions par type de crime (couleur différente)  
-    - Polygones : PDQ avec prévisions Prophet et Random Forest
-    """)
+        # --- Ajout des points de prévision cumulée par type ---
+        # Pour chaque PDQ, placer les points dans le polygone (pas tous au centroïde)
+        for _, row in pdq_boundaries.iterrows():
+            pdq_id = row['PDQ']
+            crimes_here = [t for t in filter_types if t in selected_types]
+            polygon = row['geometry']
+
+            # Générer des positions réparties dans le polygone pour chaque type de crime
+            # Si possible, utiliser les vrais coordonnées des crimes historiques
+            for i, crime_type in enumerate(crimes_here):
+                # Historique observé sur période équivalente (moyenne sur n périodes de même durée)
+                hist_df = filtered_df[
+                    (filtered_df['PDQ']==pdq_id) & (filtered_df['CATEGORIE']==crime_type)
+                ]
+                rolling_hist = hist_df.groupby('DATE').size().rolling(window=periods).sum().dropna()
+                hist_mean = rolling_hist.mean() if not rolling_hist.empty else 0
+
+                # Prévisions cumulées
+                prophet_sum = prophet_period[
+                    (prophet_period['PDQ']==pdq_id) &
+                    (prophet_period['CATEGORIE']==crime_type)
+                ]['yhat'].sum()
+
+                rf_sum = rf_period[
+                    (rf_period['PDQ']==pdq_id) &
+                    (rf_period['CATEGORIE']==crime_type)
+                ]['yhat'].sum()
+
+                if np.isnan(prophet_sum) or np.isnan(rf_sum) or (prophet_sum<seuil and rf_sum<seuil):
+                    continue
+
+                # Déterminer tendance (par rapport à moyenne historique)
+                if prophet_sum > hist_mean * 1.1:
+                    color = "red"; tendance = "⚠️ Hausse attendue"
+                elif prophet_sum < hist_mean * 0.9:
+                    color = "green"; tendance = "✅ Baisse attendue"
+                else:
+                    color = "gray"; tendance = "➖ Stable"
+
+                # 1. Essayer d'utiliser les vraies coordonnées des crimes historiques
+                lat, lon = None, None
+                if not hist_df.empty:
+                    # Prendre la médiane des coordonnées historiques pour ce type/PDQ
+                    lat = hist_df['LATITUDE'].median()
+                    lon = hist_df['LONGITUDE'].median()
+                    # Vérifier si le point est bien dans le polygone, sinon fallback
+                    from shapely.geometry import Point
+                    if not polygon.contains(Point(lon, lat)):
+                        lat, lon = None, None
+
+                # 2. Si pas de coordonnées valides, répartir dans le polygone autour du centroïde
+                if lat is None or lon is None:
+                    centroid = polygon.centroid
+                    # Décalage circulaire pour chaque type de crime
+                    type_offsets = np.linspace(0, 2 * np.pi, num=len(crimes_here), endpoint=False)
+                    offset_radius = 0.002  # Ajuste ce rayon pour espacer plus ou moins les points
+                    angle = type_offsets[i]
+                    lat_offset = offset_radius * np.cos(angle)
+                    lon_offset = offset_radius * np.sin(angle)
+                    lat = centroid.y + lat_offset
+                    lon = centroid.x + lon_offset
+                    # Si le point n'est pas dans le polygone, ramener au centroïde
+                    if not polygon.contains(Point(lon, lat)):
+                        lat = centroid.y
+                        lon = centroid.x
+
+                popup_text = f"""
+                <b>📍 PDQ {pdq_id}</b><br>
+                🔎 {crime_type}<br>
+                🕒 {min_pred_date} au {max_pred_date}<br><br>
+                ✅ Moyenne historique (période équivalente) : {hist_mean:.1f}<br>
+                🔵 Prophet (cumul) : {prophet_sum:.1f}<br>
+                🔴 RF (cumul) : {rf_sum:.1f}<br><br>
+                <b>{tendance}</b>
+                """
+
+                folium.CircleMarker(
+                    location=[lat, lon],
+                    radius=7,
+                    color=color,
+                    fill=True,
+                    fill_opacity=0.8,
+                    popup=folium.Popup(popup_text, max_width=300)
+                ).add_to(map_period)
+
+        folium_static(map_period, width=1200, height=600)
+
+        st.markdown("""
+        💡 **Légende carte**  
+        - Polygones : PDQ, couleur selon présence de prévision (rouge = prévision, gris = aucune)
+        - Points : prévision cumulée par type de crime (répartis dans le polygone ou selon la médiane des faits)
+               """)
